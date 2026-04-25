@@ -1466,6 +1466,7 @@ __export(crypto_exports, {
   decryptData: () => decryptData,
   encryptBackupFile: () => encryptBackupFile,
   encryptData: () => encryptData,
+  encryptWithRSAPublicKey: () => encryptWithRSAPublicKey,
   generateDeviceKey: () => generateDeviceKey,
   generatePKCE: () => generatePKCE,
   generateSecureJWT: () => generateSecureJWT,
@@ -1737,6 +1738,33 @@ async function generateDeviceKey(userId, secret) {
   );
   const signature = await crypto.subtle.sign("HMAC", keyMaterial, encoder6.encode(userId + "device_salt_offline_key"));
   return Array.from(new Uint8Array(signature)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function encryptWithRSAPublicKey(data, publicKeyBase64) {
+  try {
+    const binary_string = atob(publicKeyBase64);
+    const len = binary_string.length;
+    const bytes = new Uint8Array(len);
+    for (let i2 = 0; i2 < len; i2++) bytes[i2] = binary_string.charCodeAt(i2);
+    const spkiBuffer = bytes.buffer;
+    const publicKey = await crypto.subtle.importKey(
+      "spki",
+      spkiBuffer,
+      { name: "RSA-OAEP", hash: "SHA-256" },
+      false,
+      ["encrypt"]
+    );
+    const encoder6 = new TextEncoder();
+    const dataBuffer = encoder6.encode(data);
+    const encryptedBuffer = await crypto.subtle.encrypt(
+      { name: "RSA-OAEP" },
+      publicKey,
+      dataBuffer
+    );
+    return btoa(String.fromCharCode(...new Uint8Array(encryptedBuffer)));
+  } catch (e2) {
+    console.warn("[Crypto] RSA encryption failed, falling back to raw data:", e2);
+    return data;
+  }
 }
 var CRYPTO_CONFIG, derivedKeyCache;
 var init_crypto = __esm({
@@ -27992,7 +28020,8 @@ function normalizeOtpAccount(item = {}) {
     account = account.split(":").pop()?.trim() || account;
   }
   normalized.account = sanitizeInput(account, 100);
-  normalized.secret = (normalized.secret || "").replace(/[\s=]/g, "").toUpperCase();
+  const rawSecret = normalized.secret || "";
+  normalized.secret = rawSecret.startsWith("nodeauth:") ? rawSecret : rawSecret.replace(/[\s=]/g, "").toUpperCase();
   normalized.counter = parseInt(normalized.counter || "0");
   if (isNaN(normalized.counter) || normalized.counter < 0) normalized.counter = 0;
   return normalized;
@@ -51790,6 +51819,7 @@ function parseUserAgent(ua) {
 }
 
 // src/shared/utils/masking.ts
+import { Buffer as Buffer2 } from "node:buffer";
 var maskUserId = (id) => {
   if (!id) return "***";
   if (id.includes("@")) {
@@ -51820,6 +51850,60 @@ var maskIp = (ip) => {
   }
   return ip;
 };
+var ALGORITHM = "AES-GCM";
+async function deriveMaskingKey(salt) {
+  const encoder6 = new TextEncoder();
+  const saltBuffer = typeof salt === "string" ? encoder6.encode(salt) : salt;
+  const hashBuffer = await crypto.subtle.digest("SHA-256", new Uint8Array(saltBuffer));
+  return Buffer2.from(hashBuffer);
+}
+async function maskSecret(secretText, maskingKey) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const keyUsage = await crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(maskingKey),
+    ALGORITHM,
+    false,
+    ["encrypt"]
+  );
+  const encoder6 = new TextEncoder();
+  const dataBuffer = encoder6.encode(secretText);
+  const ciphertextBuffer = await crypto.subtle.encrypt(
+    { name: ALGORITHM, iv },
+    keyUsage,
+    dataBuffer
+  );
+  const combined = new Uint8Array(iv.length + ciphertextBuffer.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ciphertextBuffer), iv.length);
+  return "nodeauth:" + Buffer2.from(combined).toString("base64");
+}
+async function unmaskSecret(maskedData, maskingKey) {
+  if (!maskedData.startsWith("nodeauth:")) {
+    throw new Error("invalid_masking_prefix");
+  }
+  const payload = maskedData.slice("nodeauth:".length);
+  const combined = Buffer2.from(payload, "base64");
+  if (combined.length < 12) {
+    throw new Error("invalid_payload_length");
+  }
+  const iv = combined.subarray(0, 12);
+  const ciphertext = combined.subarray(12);
+  const keyUsage = await crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(maskingKey),
+    ALGORITHM,
+    false,
+    ["decrypt"]
+  );
+  const decryptedBuffer = await crypto.subtle.decrypt(
+    { name: ALGORITHM, iv },
+    keyUsage,
+    ciphertext
+  );
+  const decoder2 = new TextDecoder();
+  return decoder2.decode(decryptedBuffer);
+}
 
 // src/features/auth/sessionService.ts
 var SessionService = class {
@@ -64018,10 +64102,16 @@ auth.post("/callback/:provider", rateLimit({
     path: "/"
   });
   await resetRateLimit(c, `rl:${clientIp}:/api/auth/callback/${providerName}`);
+  const publicKey = body.publicKey;
+  let finalDeviceKey = deviceKey;
+  if (publicKey && deviceKey) {
+    const { encryptWithRSAPublicKey: encryptWithRSAPublicKey2 } = await Promise.resolve().then(() => (init_crypto(), crypto_exports));
+    finalDeviceKey = await encryptWithRSAPublicKey2(deviceKey, publicKey);
+  }
   return c.json({
     success: true,
     userInfo,
-    deviceKey,
+    deviceKey: finalDeviceKey,
     needsEmergency,
     encryptionKey
   });
@@ -64044,12 +64134,17 @@ auth.get("/me", authMiddleware, async (c) => {
   const repository = new EmergencyRepository(c.env.DB);
   const isEmergencyConfirmed = await repository.isEmergencyConfirmed();
   const encryptionKey = !isEmergencyConfirmed ? c.env.ENCRYPTION_KEY : void 0;
-  const { generateDeviceKey: generateDeviceKey2 } = await Promise.resolve().then(() => (init_crypto(), crypto_exports));
+  const { generateDeviceKey: generateDeviceKey2, encryptWithRSAPublicKey: encryptWithRSAPublicKey2 } = await Promise.resolve().then(() => (init_crypto(), crypto_exports));
   const deviceKey = await generateDeviceKey2(user.email || user.id, c.env.JWT_SECRET || "");
+  const publicKey = c.req.header("X-Public-Key");
+  let finalDeviceKey = deviceKey;
+  if (publicKey && deviceKey) {
+    finalDeviceKey = await encryptWithRSAPublicKey2(deviceKey, publicKey);
+  }
   return c.json({
     success: true,
     userInfo: user,
-    deviceKey,
+    deviceKey: finalDeviceKey,
     needsEmergency: !isEmergencyConfirmed,
     encryptionKey
   });
@@ -64125,9 +64220,14 @@ auth.post("/webauthn/login/verify", rateLimit({
   });
   await resetRateLimit(c, `rl:${clientIp}:/api/auth/webauthn/login/verify`);
   deleteCookie(c, "webauthn_login_challenge", { path: "/", secure: isSecureContext(c) });
+  let finalDeviceKey = result.deviceKey;
+  if (body.publicKey && result.deviceKey) {
+    const { encryptWithRSAPublicKey: encryptWithRSAPublicKey2 } = await Promise.resolve().then(() => (init_crypto(), crypto_exports));
+    finalDeviceKey = await encryptWithRSAPublicKey2(result.deviceKey, body.publicKey);
+  }
   return c.json({
     success: true,
-    deviceKey: result.deviceKey,
+    deviceKey: finalDeviceKey,
     userInfo: result.userInfo,
     needsEmergency: result.needsEmergency,
     encryptionKey: result.encryptionKey
@@ -64206,9 +64306,14 @@ auth.post("/web3/login/verify", rateLimit({
   });
   await resetRateLimit(c, `rl:${clientIp}:/api/auth/web3/login/verify`);
   deleteCookie(c, "web3_login_nonce", { path: "/", secure: isSecureContext(c) });
+  let finalDeviceKey = result.deviceKey;
+  if (body.publicKey && result.deviceKey) {
+    const { encryptWithRSAPublicKey: encryptWithRSAPublicKey2 } = await Promise.resolve().then(() => (init_crypto(), crypto_exports));
+    finalDeviceKey = await encryptWithRSAPublicKey2(result.deviceKey, body.publicKey);
+  }
   return c.json({
     success: true,
-    deviceKey: result.deviceKey,
+    deviceKey: finalDeviceKey,
     userInfo: result.userInfo,
     needsEmergency: result.needsEmergency,
     encryptionKey: result.encryptionKey
@@ -64317,7 +64422,7 @@ async function batchInsertVaultItems(dbClient, items, key, createdBy, startSortO
 // src/features/vault/vaultService.ts
 init_crypto();
 init_otp();
-import { Buffer as Buffer2 } from "node:buffer";
+import { Buffer as Buffer3 } from "node:buffer";
 var VaultService = class {
   repository;
   env;
@@ -64330,28 +64435,42 @@ var VaultService = class {
     }
     this.encryptionKey = env.ENCRYPTION_KEY;
   }
+  async wrapZeroKnowledgeSecret(userId, sseEncryptedSecret) {
+    if (!sseEncryptedSecret) return sseEncryptedSecret;
+    try {
+      const plain = await decryptField(sseEncryptedSecret, this.encryptionKey);
+      const salt = await generateDeviceKey(userId, this.env.JWT_SECRET || "");
+      const maskingKey = await deriveMaskingKey(salt);
+      return await maskSecret(plain, maskingKey);
+    } catch (e2) {
+      return sseEncryptedSecret;
+    }
+  }
   /**
    * 获取所有账户 (解密)
    */
   async getAllAccounts() {
     const items = await this.repository.findAll();
-    return Promise.all(items.map(async (item) => ({
+    return await Promise.all(items.map(async (item) => ({
       ...item,
-      secret: await decryptField(item.secret, this.encryptionKey) || ""
+      secret: item.secret ? await decryptField(item.secret, this.encryptionKey) : item.secret
     })));
   }
   /**
    * 获取分页和搜索条件后的所有账户 (解密)
    */
-  async getAccountsPaginated(page, limit, search, category = "") {
+  async getAccountsPaginated(userId, page, limit, search, category = "") {
     const items = await this.repository.findPaginated(page, limit, search, category);
     const totalCount = await this.repository.count(search, category);
     const categoryStats = await this.repository.getCategoryStats();
     const trashCount = await this.repository.countDeleted();
-    const decryptedItems = await Promise.all(items.map(async (item) => ({
-      ...item,
-      secret: await decryptField(item.secret, this.encryptionKey) || ""
-    })));
+    const decryptedItems = await Promise.all(items.map(async (item) => {
+      const { createdBy: _c, updatedBy: _u, ...rest } = item;
+      return {
+        ...rest,
+        secret: await this.wrapZeroKnowledgeSecret(userId, item.secret)
+      };
+    }));
     return {
       items: decryptedItems,
       totalCount,
@@ -64393,7 +64512,17 @@ var VaultService = class {
   }
   async createAccount(userId, data) {
     const normalized = normalizeOtpAccount(data);
-    const { service, account, secret, algorithm, digits, period, type, counter, category } = normalized;
+    const { service, account, algorithm, digits, period, type, counter, category } = normalized;
+    let secret = normalized.secret;
+    if (secret && secret.startsWith("nodeauth:")) {
+      const salt = await generateDeviceKey(userId, this.env.JWT_SECRET || "");
+      const maskingKey = await deriveMaskingKey(salt);
+      try {
+        secret = await unmaskSecret(secret, maskingKey);
+      } catch (e2) {
+        throw new AppError("invalid_secret_format", 400);
+      }
+    }
     if (!service || !account || !secret) {
       throw new AppError("invalid_secret_format", 400);
     }
@@ -64424,7 +64553,7 @@ var VaultService = class {
     }
     const encryptedSecret = await encryptField(secret, this.encryptionKey);
     const maxSort = await this.repository.getMaxSortOrder();
-    return await this.repository.create({
+    const created = await this.repository.create({
       id: crypto.randomUUID(),
       service,
       account,
@@ -64439,6 +64568,11 @@ var VaultService = class {
       createdAt: Date.now(),
       createdBy: userId
     });
+    const { createdBy: _c, updatedBy: _u, ...restCreated } = created;
+    return {
+      ...restCreated,
+      secret: await this.wrapZeroKnowledgeSecret(userId, encryptedSecret)
+    };
   }
   /**
    * HOTP 原子递增并获取新验证码
@@ -64468,17 +64602,26 @@ var VaultService = class {
       counter: newCounter
     };
   }
-  async updateAccount(id, data) {
+  async updateAccount(userId, id, data) {
     const existing = await this.repository.findById(id);
     if (!existing) throw new AppError("account_not_found", 404);
     const normalized = normalizeOtpAccount({ ...existing, ...data });
     const { service: normService, account: normAccount, secret: newSecret, algorithm: normAlgo, digits: normDigits, period: normPeriod, type: normType, counter: normCounter, category: normCategory } = normalized;
     let encryptedSecret;
     if (data.secret !== void 0) {
-      if (!newSecret || normType !== "steam" && !validateBase32Secret(newSecret)) {
+      let finalSecret = newSecret;
+      if (finalSecret && finalSecret.startsWith("nodeauth:")) {
+        const salt = await generateDeviceKey(userId, this.env.JWT_SECRET || "");
+        const maskingKey = await deriveMaskingKey(salt);
+        try {
+          finalSecret = await unmaskSecret(finalSecret, maskingKey);
+        } catch (e2) {
+        }
+      }
+      if (!finalSecret || normType !== "steam" && !validateBase32Secret(finalSecret)) {
         throw new AppError("invalid_secret_format", 400);
       }
-      encryptedSecret = await encryptField(newSecret, this.encryptionKey);
+      encryptedSecret = await encryptField(finalSecret, this.encryptionKey);
     } else {
       encryptedSecret = existing.secret;
     }
@@ -64503,7 +64646,12 @@ var VaultService = class {
         throw new AppError("conflict_detected", 409);
       }
     }
-    return updated;
+    const { createdBy: _c, updatedBy: _u, ...restExisting } = existing;
+    return {
+      ...restExisting,
+      ...updateFields,
+      secret: await this.wrapZeroKnowledgeSecret(userId, encryptedSecret)
+    };
   }
   /**
    * 删除账户 (支持冲突校验与强制删除)
@@ -64525,9 +64673,27 @@ var VaultService = class {
     return { count };
   }
   /**
+   * 导出前将密文完全还原为明文（SSE 解密 + 零知识解封装）
+   */
+  async plainSecretForExport(userId, sseEncryptedSecret) {
+    if (!sseEncryptedSecret) return null;
+    try {
+      const plain = await decryptField(sseEncryptedSecret, this.encryptionKey);
+      if (!plain) return null;
+      if (plain.startsWith("nodeauth:")) {
+        const salt = await generateDeviceKey(userId, this.env.JWT_SECRET || "");
+        const maskingKey = await deriveMaskingKey(salt);
+        return await unmaskSecret(plain, maskingKey);
+      }
+      return plain;
+    } catch (e2) {
+      return null;
+    }
+  }
+  /**
    * 处理导出
    */
-  async exportAccounts(type, password) {
+  async exportAccounts(userId, type, password) {
     const SECURITY_CONFIG2 = { MIN_EXPORT_PASSWORD_LENGTH: 5 };
     if (!["encrypted", "json", "2fas", "text"].includes(type)) {
       throw new AppError("export_type_invalid", 400);
@@ -64537,7 +64703,14 @@ var VaultService = class {
         throw new AppError("export_password_length", 400);
       }
     }
-    const plainItems = await this.getAllAccounts();
+    const rawItems = await this.getAllAccounts();
+    const plainItems = await Promise.all(rawItems.map(async (item) => {
+      const { createdBy: _c, updatedBy: _u, ...rest } = item;
+      return {
+        ...rest,
+        secret: await this.plainSecretForExport(userId, item.secret)
+      };
+    }));
     const timestamp3 = (/* @__PURE__ */ new Date()).toISOString();
     const baseData = { version: "2.0", app: "nodeauth", timestamp: timestamp3 };
     if (type === "encrypted") {
@@ -64570,7 +64743,7 @@ var VaultService = class {
         return buildOTPAuthURI({
           service: acc.service,
           account: acc.account,
-          secret: acc.secret,
+          secret: acc.secret ?? "",
           algorithm: acc.algorithm ?? void 0,
           digits: acc.digits ?? void 0,
           period: acc.period ?? void 0
@@ -64776,7 +64949,7 @@ var VaultService = class {
       }
       const { deviceSecret } = await restoreRes.json();
       if (!deviceSecret) throw new AppError("invalid_restore_response", 500);
-      return bytesToBase32(new Uint8Array(Buffer2.from(deviceSecret, "hex")));
+      return bytesToBase32(new Uint8Array(Buffer3.from(deviceSecret, "hex")));
     } catch (err) {
       if (err instanceof AppError) throw err;
       console.error("[BlizzardRestore] Unexpected flow error:", err.message || err);
@@ -64812,7 +64985,7 @@ var VaultService = class {
             break;
           case "update":
             try {
-              await this.updateAccount(id, data);
+              await this.updateAccount(userId, id, data);
             } catch (e2) {
               if (e2.statusCode === 409) {
                 const existing = await this.repository.findById(id);
@@ -65249,8 +65422,9 @@ vault5.get("/", async (c) => {
   const limit = parseInt(c.req.query("limit") || "12", 10);
   const search = c.req.query("search") || "";
   const category = c.req.query("category") || "";
+  const user = c.get("user");
   const service = getService2(c);
-  const result = await service.getAccountsPaginated(page, limit, search, category);
+  const result = await service.getAccountsPaginated(user.email || user.id, page, limit, search, category);
   return c.json({
     success: true,
     vault: result.items,
@@ -65321,14 +65495,15 @@ vault5.post("/", async (c) => {
   const user = c.get("user");
   const data = await c.req.json();
   const service = getService2(c);
-  const item = await service.createAccount(user.username, data);
+  const item = await service.createAccount(user.email || user.id, data);
   return c.json({ success: true, item });
 });
 vault5.put("/:id", async (c) => {
   const id = c.req.param("id");
   const data = await c.req.json();
+  const user = c.get("user");
   const service = getService2(c);
-  const item = await service.updateAccount(id, data);
+  const item = await service.updateAccount(user.email || user.id, id, data);
   return c.json({ success: true, item });
 });
 vault5.delete("/:id", async (c) => {
@@ -65361,9 +65536,10 @@ vault5.post("/export", rateLimit({
   windowMs: 60 * 1e3,
   max: 5
 }), async (c) => {
+  const user = c.get("user");
   const service = getService2(c);
   const { type, password } = await c.req.json();
-  const result = await service.exportAccounts(type, password);
+  const result = await service.exportAccounts(user.email || user.id, type, password);
   if (result.isText) {
     return c.text(result.data);
   }
@@ -65376,7 +65552,7 @@ vault5.post("/import", rateLimit({
   const user = c.get("user");
   const service = getService2(c);
   const { content, type, password } = await c.req.json();
-  const result = await service.importAccounts(user.username, type, content, password);
+  const result = await service.importAccounts(user.email || user.id, type, content, password);
   return c.json({ success: true, ...result });
 });
 vault5.post("/import/blizzard-net", rateLimit({
@@ -65406,7 +65582,7 @@ vault5.post("/add-from-uri", async (c) => {
     return c.json({ success: false, error: "\u65E0\u6548\u7684 OTP URI \u683C\u5F0F" }, 400);
   }
   const service = getService2(c);
-  const item = await service.createAccount(user.username, {
+  const item = await service.createAccount(user.email || user.id, {
     service: parsed.issuer,
     account: parsed.account,
     secret: parsed.secret,
@@ -65426,7 +65602,7 @@ vault5.post("/sync", async (c) => {
     return c.json({ success: false, error: "actions must be an array" }, 400);
   }
   const service = getService2(c);
-  const results = await service.batchSync(user.username, actions);
+  const results = await service.batchSync(user.email || user.id, actions);
   return c.json({ success: true, results });
 });
 vault5.post("/migrate-crypto", async (c) => {
@@ -65908,7 +66084,7 @@ import http3 from "node:http";
 import https from "node:https";
 import zlib from "node:zlib";
 import Stream2, { PassThrough as PassThrough2, pipeline as pump } from "node:stream";
-import { Buffer as Buffer4 } from "node:buffer";
+import { Buffer as Buffer5 } from "node:buffer";
 
 // node_modules/data-uri-to-buffer/dist/index.js
 function dataUriToBuffer(uri) {
@@ -65954,7 +66130,7 @@ init_fetch_blob();
 init_esm_min();
 import Stream, { PassThrough } from "node:stream";
 import { types, deprecate, promisify } from "node:util";
-import { Buffer as Buffer3 } from "node:buffer";
+import { Buffer as Buffer4 } from "node:buffer";
 
 // node_modules/node-fetch/src/errors/base.js
 var FetchBaseError = class extends Error {
@@ -66020,22 +66196,22 @@ var Body = class {
     if (body === null) {
       body = null;
     } else if (isURLSearchParameters(body)) {
-      body = Buffer3.from(body.toString());
+      body = Buffer4.from(body.toString());
     } else if (isBlob(body)) {
-    } else if (Buffer3.isBuffer(body)) {
+    } else if (Buffer4.isBuffer(body)) {
     } else if (types.isAnyArrayBuffer(body)) {
-      body = Buffer3.from(body);
+      body = Buffer4.from(body);
     } else if (ArrayBuffer.isView(body)) {
-      body = Buffer3.from(body.buffer, body.byteOffset, body.byteLength);
+      body = Buffer4.from(body.buffer, body.byteOffset, body.byteLength);
     } else if (body instanceof Stream) {
     } else if (body instanceof FormData2) {
       body = formDataToBlob(body);
       boundary = body.type.split("=")[1];
     } else {
-      body = Buffer3.from(String(body));
+      body = Buffer4.from(String(body));
     }
     let stream = body;
-    if (Buffer3.isBuffer(body)) {
+    if (Buffer4.isBuffer(body)) {
       stream = Stream.Readable.from(body);
     } else if (isBlob(body)) {
       stream = Stream.Readable.from(body.stream());
@@ -66147,10 +66323,10 @@ async function consumeBody(data) {
   }
   const { body } = data;
   if (body === null) {
-    return Buffer3.alloc(0);
+    return Buffer4.alloc(0);
   }
   if (!(body instanceof Stream)) {
-    return Buffer3.alloc(0);
+    return Buffer4.alloc(0);
   }
   const accum = [];
   let accumBytes = 0;
@@ -66171,9 +66347,9 @@ async function consumeBody(data) {
   if (body.readableEnded === true || body._readableState.ended === true) {
     try {
       if (accum.every((c) => typeof c === "string")) {
-        return Buffer3.from(accum.join(""));
+        return Buffer4.from(accum.join(""));
       }
-      return Buffer3.concat(accum, accumBytes);
+      return Buffer4.concat(accum, accumBytes);
     } catch (error) {
       throw new FetchError(`Could not create Buffer from response body for ${data.url}: ${error.message}`, "system", error);
     }
@@ -66216,7 +66392,7 @@ var extractContentType = (body, request2) => {
   if (isBlob(body)) {
     return body.type || null;
   }
-  if (Buffer3.isBuffer(body) || types.isAnyArrayBuffer(body) || ArrayBuffer.isView(body)) {
+  if (Buffer4.isBuffer(body) || types.isAnyArrayBuffer(body) || ArrayBuffer.isView(body)) {
     return null;
   }
   if (body instanceof FormData2) {
@@ -66238,7 +66414,7 @@ var getTotalBytes = (request2) => {
   if (isBlob(body)) {
     return body.size;
   }
-  if (Buffer3.isBuffer(body)) {
+  if (Buffer4.isBuffer(body)) {
     return body.length;
   }
   if (body && typeof body.getLengthSync === "function") {
@@ -67152,7 +67328,7 @@ async function fetch3(url, options_) {
   });
 }
 function fixResponseChunkedTransferBadEnding(request2, errorCallback) {
-  const LAST_CHUNK = Buffer4.from("0\r\n\r\n");
+  const LAST_CHUNK = Buffer5.from("0\r\n\r\n");
   let isChunkedTransfer = false;
   let properLastChunkReceived = false;
   let previousChunk;
@@ -67169,9 +67345,9 @@ function fixResponseChunkedTransferBadEnding(request2, errorCallback) {
       }
     };
     const onData = (buf) => {
-      properLastChunkReceived = Buffer4.compare(buf.slice(-5), LAST_CHUNK) === 0;
+      properLastChunkReceived = Buffer5.compare(buf.slice(-5), LAST_CHUNK) === 0;
       if (!properLastChunkReceived && previousChunk) {
-        properLastChunkReceived = Buffer4.compare(previousChunk.slice(-3), LAST_CHUNK.slice(0, 3)) === 0 && Buffer4.compare(buf.slice(-2), LAST_CHUNK.slice(3)) === 0;
+        properLastChunkReceived = Buffer5.compare(previousChunk.slice(-3), LAST_CHUNK.slice(0, 3)) === 0 && Buffer5.compare(buf.slice(-2), LAST_CHUNK.slice(3)) === 0;
       }
       previousChunk = buf;
     };

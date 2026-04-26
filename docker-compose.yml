@@ -5,7 +5,7 @@ services:
     container_name: nodeauth
     restart: unless-stopped
     ports:
-      - "53000:3000"
+      - "3000:3000"
     volumes:
       - ./data:/app/data
     environment:
